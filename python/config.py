@@ -29,7 +29,7 @@ class Config:
     learning_rate: float = 1e-3
     weight_decay: float = 1e-4
     epochs_per_iteration: int = 5  # 1イテレーションあたりの学習エポック数
-    replay_buffer_size: int = 50_000  # 直近の局面数（古いものから捨てる)
+    replay_buffer_size: int = 200_000  # 直近の局面数（古いものから捨てる)
 
     # ── 学習ループ全体 ───────────────────────────────
     num_iterations: int = 100  # イテレーション総数
