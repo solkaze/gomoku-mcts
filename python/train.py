@@ -167,7 +167,14 @@ def main(cfg: Config = DEFAULT) -> None:
         weight_decay=cfg.weight_decay,
     )
 
-    buffer = ReplayBuffer(capacity=cfg.replay_buffer_size)
+    # バッファの読み込み（既存ファイルがあれば復元）
+    from pathlib import Path as _Path
+
+    if _Path(cfg.buffer_path).exists():
+        buffer = ReplayBuffer.load(cfg.buffer_path)
+        print(f"バッファを復元: {len(buffer):,} サンプル")
+    else:
+        buffer = ReplayBuffer(capacity=cfg.replay_buffer_size)
 
     # 学習統計の読み込み（再開時に累計を引き継ぐ）
     stats_all = TrainingStats.load(cfg.stats_path)
@@ -221,9 +228,10 @@ def main(cfg: Config = DEFAULT) -> None:
             f"イテレーション={stats_all.total_iterations}"
         )
 
-        # モデル・統計を保存
+        # モデル・統計・バッファを保存
         net.save_binary(cfg.model_path)
         stats_all.save(cfg.stats_path)
+        buffer.save(cfg.buffer_path)
 
         # lossが最良を更新したらbest_model.binとして別途保存
         if stats.get("loss") is not None:

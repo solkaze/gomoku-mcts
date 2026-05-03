@@ -39,6 +39,7 @@ class Config:
     best_model_path: str = "/workspace/models/best_model.bin"  # 追加
     checkpoint_dir: str = "/workspace/models/checkpoints"
     stats_path: str = "/workspace/models/training_stats.json"
+    buffer_path: str = "/workspace/models/replay_buffer.npz"
 
     # ── デバイス ─────────────────────────────────────
     device: str = "cuda"  # "cpu" / "cuda"
