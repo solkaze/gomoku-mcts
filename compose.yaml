@@ -1,0 +1,37 @@
+services:
+  trainer:
+    build:
+      context: ./python
+      dockerfile: Dockerfile
+    image: gomoku-trainer:latest
+    container_name: gomoku-trainer
+
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+    # PyTorch のマルチプロセスDataLoaderに必要
+    shm_size: "2gb"
+
+    volumes:
+      - ./python:/workspace/python
+      - ./models:/workspace/models
+
+    working_dir: /workspace/python
+
+    environment:
+      - PYTHONUNBUFFERED=1
+      - CUDA_VISIBLE_DEVICES=0
+      - MODEL_OUTPUT=/workspace/models/model.bin
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+    command: bash
