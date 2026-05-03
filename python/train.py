@@ -176,10 +176,22 @@ def main(cfg: Config = DEFAULT) -> None:
         print(stats_all.summary())
 
     # ── イテレーションループ ──────────────────────────
-    for iter_idx in range(1, cfg.num_iterations + 1):
+    # 累計イテレーション数を目標値として扱う
+    # 再実行時は残り分だけ走る
+    already_done = stats_all.total_iterations
+    target_total = already_done + cfg.num_iterations
+    remaining = cfg.num_iterations
+
+    if already_done > 0:
+        print(
+            f"\n累計 {already_done} イテレーション完了済み。"
+            f"{remaining} イテレーション追加します（目標合計: {target_total}）。"
+        )
+
+    for iter_idx in range(1, remaining + 1):
         global_iter = stats_all.total_iterations + 1
         print(
-            f"\n=== Iteration {iter_idx}/{cfg.num_iterations}  (global #{global_iter}) ==="
+            f"\n=== Iteration {iter_idx}/{remaining}  (global #{global_iter} / 目標{target_total}) ==="
         )
         stats = run_iteration(net, optimizer, buffer, cfg, device, iter_idx)
 
