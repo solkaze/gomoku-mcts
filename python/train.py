@@ -224,6 +224,14 @@ def main(cfg: Config = DEFAULT) -> None:
         # モデル・統計を保存
         net.save_binary(cfg.model_path)
         stats_all.save(cfg.stats_path)
+
+        # lossが最良を更新したらbest_model.binとして別途保存
+        if stats.get("loss") is not None:
+            history = stats_all.loss_history
+            if len(history) == 1 or stats["loss"] < min(history[:-1]):
+                net.save_binary(cfg.best_model_path)
+                print(f"  best_model更新: loss={stats['loss']:.4f}")
+
         if iter_idx % 10 == 0:
             ckpt = (
                 Path(cfg.checkpoint_dir)

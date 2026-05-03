@@ -21,21 +21,22 @@ class Config:
 
     # ── 自己対局 ─────────────────────────────────────
     games_per_iteration: int = 50  # 1イテレーションあたりの対局数
-    temperature_threshold: int = 15  # この手数まで温度=1（探索)、以降は温度→0
-    max_moves: int = 225  # 最大手数（盤面が埋まる前にcut）
+    temperature_threshold: int = 15  # この手数まで温度=1（探索）、以降は温度→0
+    max_moves: int = 225  # 最大手数
 
     # ── 学習 ─────────────────────────────────────────
     batch_size: int = 256
-    learning_rate: float = 1e-3
+    learning_rate: float = 3e-4  # 1e-3 → 3e-4（発散抑制）
     weight_decay: float = 1e-4
-    epochs_per_iteration: int = 5  # 1イテレーションあたりの学習エポック数
-    replay_buffer_size: int = 200_000  # 直近の局面数（古いものから捨てる)
+    epochs_per_iteration: int = 3  # 5 → 3（過学習抑制）
+    replay_buffer_size: int = 200_000  # 50,000 → 200,000
 
     # ── 学習ループ全体 ───────────────────────────────
-    num_iterations: int = 100  # イテレーション総数
+    num_iterations: int = 100
 
     # ── パス ─────────────────────────────────────────
     model_path: str = "/workspace/models/model.bin"
+    best_model_path: str = "/workspace/models/best_model.bin"  # 追加
     checkpoint_dir: str = "/workspace/models/checkpoints"
     stats_path: str = "/workspace/models/training_stats.json"
 
