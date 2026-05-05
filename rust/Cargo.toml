@@ -4,3 +4,10 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+ort = { version = "2.0.0-rc.10", default-features = false, features = ["ndarray", "load-dynamic"] }
+ndarray = "0.16"
+ 
+[profile.release]
+opt-level = 3
+lto = true
+
