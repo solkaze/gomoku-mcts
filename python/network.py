@@ -92,14 +92,24 @@ class GomokuNet(nn.Module):
 
     @staticmethod
     def board_to_tensor(
-        board: np.ndarray,  # shape (15,15)  0=空, 1=自分, 2=相手
-        is_first_player: bool,
+        board: np.ndarray,  # shape (15,15)  0=空, 1=黒, 2=白
+        to_play: int,  # 次に打つ側: 1=黒(先手), 2=白(後手)
         device: torch.device | None = None,
     ) -> torch.Tensor:
-        """盤面を (1, 3, 15, 15) のテンソルに変換"""
-        ch0 = (board == 1).astype(np.float32)  # 自分
-        ch1 = (board == 2).astype(np.float32)  # 相手
-        ch2 = np.ones_like(ch0) if is_first_player else np.zeros_like(ch0)
+        """
+        盤面を (1, 3, 15, 15) のテンソルに変換
+
+        Ch.0 = to_playの石（自分の石）
+        Ch.1 = 相手の石
+        Ch.2 = 全1なら先手番(to_play=1)、全0なら後手番(to_play=2)
+
+        盤面そのものは黒=1,白=2 のまま受け取り、ここで視点変換する。
+        """
+        opp = 3 - to_play  # 1↔2
+        ch0 = (board == to_play).astype(np.float32)
+        ch1 = (board == opp).astype(np.float32)
+        is_first = to_play == 1
+        ch2 = np.ones_like(ch0) if is_first else np.zeros_like(ch0)
         tensor = torch.from_numpy(np.stack([ch0, ch1, ch2], axis=0)).unsqueeze(0)
         if device is not None:
             tensor = tensor.to(device)
@@ -203,7 +213,7 @@ if __name__ == "__main__":
     board = np.zeros((BOARD_SIZE, BOARD_SIZE), dtype=np.int8)
     board[7][7] = 1  # 自分の石
     board[7][8] = 2  # 相手の石
-    x = GomokuNet.board_to_tensor(board, is_first_player=True, device=device)
+    x = GomokuNet.board_to_tensor(board, to_play=1, device=device)
 
     net.eval()
     with torch.no_grad():

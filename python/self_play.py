@@ -1,12 +1,18 @@
 """
-自己対局モジュール
-NN + MCTS で1局を実行し、(盤面, MCTS確率分布, 勝敗) を蓄積する。
+自己対局モジュール - 修正版
+
+設計:
+  ・盤面は常に「黒=1, 白=2」のまま保持
+  ・MCTS呼び出し時に to_play を渡すだけ
+  ・GameSampleには (盤面, to_play, mcts_probs, value) を保存
+  ・valueはその局面の「to_play視点」での最終勝敗
 """
 
 from typing import NamedTuple
 
 import numpy as np
 import torch
+
 from config import Config
 from mcts import MCTS, check_winner, get_legal_moves
 from network import BOARD_SIZE, GomokuNet
@@ -15,103 +21,76 @@ from network import BOARD_SIZE, GomokuNet
 class GameSample(NamedTuple):
     """学習用の1局面サンプル"""
 
-    board: np.ndarray  # (15, 15) int8: 0=空, 1=自分, 2=相手
-    is_first_player: bool  # この局面で打つ側が先手か
-    mcts_probs: np.ndarray  # (225,) MCTSが出した着手確率（学習のターゲット）
-    value: float  # この局面で打つ側から見た最終勝敗 [-1, 1]
+    board: np.ndarray  # (15, 15) int8: 0=空, 1=黒, 2=白（生の盤面）
+    to_play: int  # この局面で打つ側: 1=黒 or 2=白
+    mcts_probs: np.ndarray  # (225,) MCTSの着手確率
+    value: float  # to_play視点での最終勝敗 [-1, 1]
 
 
 def play_one_game(
     net: GomokuNet, cfg: Config, device: torch.device
 ) -> list[GameSample]:
-    """1局自己対局して、その棋譜から学習サンプルのリストを返す"""
+    """1局自己対局して、学習サンプルのリストを返す"""
 
     mcts = MCTS(net, device, n_sim=cfg.n_simulations)
 
     board = np.zeros((BOARD_SIZE, BOARD_SIZE), dtype=np.int8)
-    stone = 1  # 1=先手から開始
+    to_play = 1  # 黒(先手)から開始
 
-    # 各手の (盤面, 手番, mcts確率) を一時保存
+    # (盤面, to_play, mcts_probs) を一時保存
     history: list[tuple[np.ndarray, int, np.ndarray]] = []
 
-    winner = 0  # 0=引き分け, 1=先手勝ち, 2=後手勝ち
+    winner = 0  # 0=引き分け, 1=黒勝ち, 2=白勝ち
 
     for move_count in range(cfg.max_moves):
-        # 序盤は探索広く、終盤は確定的に
         if move_count < cfg.temperature_threshold:
             temp = 1.0
         else:
             temp = 0.0
 
-        # MCTSで着手確率を取得（Note: stoneの視点に変換するためboard表現を切り替え）
-        # MCTS内部では「自分=1, 相手=2」を期待しているので、現在手番の視点に変換
-        my_view = _to_my_view(board, stone)
-        probs = mcts.get_action_probs(my_view, stone=1, temperature=temp)
+        # MCTSで着手確率を取得（盤面は生のまま渡す）
+        probs = mcts.get_action_probs(board, to_play=to_play, temperature=temp)
 
-        # 履歴に保存（盤面は元のまま、視点情報だけ持っておく）
-        history.append((board.copy(), stone, probs))
+        history.append((board.copy(), to_play, probs))
 
-        # 着手選択
-        legal = get_legal_moves(my_view)
+        legal = get_legal_moves(board)
         if not legal:
             break
 
-        # probsから着手をサンプリング（temp=0なら最大値固定）
         if temp == 0.0:
             move = int(np.argmax(probs))
         else:
             move = int(np.random.choice(len(probs), p=probs))
 
-        # 盤面に反映
         r, c = divmod(move, BOARD_SIZE)
-        board[r][c] = stone
+        board[r][c] = to_play  # 黒なら1、白なら2 を直接置く
 
-        # 勝敗判定
-        if check_winner(board, r, c, stone):
-            winner = stone
+        if check_winner(board, r, c, to_play):
+            winner = to_play
             break
 
-        # 手番交代
-        stone = 3 - stone
+        to_play = 3 - to_play
 
-    # 各サンプルに勝敗結果を割り当てる
+    # 各サンプルに勝敗結果を割り当て（to_play視点でのvalue）
     samples: list[GameSample] = []
-    for hist_board, hist_stone, hist_probs in history:
+    for hist_board, hist_to_play, hist_probs in history:
         if winner == 0:
             value = 0.0
-        elif winner == hist_stone:
+        elif winner == hist_to_play:
             value = 1.0
         else:
             value = -1.0
 
-        # 視点を「自分=1, 相手=2」に統一
-        my_view = _to_my_view(hist_board, hist_stone)
-        is_first = hist_stone == 1
-
         samples.append(
             GameSample(
-                board=my_view,
-                is_first_player=is_first,
+                board=hist_board,
+                to_play=hist_to_play,
                 mcts_probs=hist_probs.astype(np.float32),
                 value=value,
             )
         )
 
     return samples
-
-
-def _to_my_view(board: np.ndarray, stone: int) -> np.ndarray:
-    """
-    生の盤面（1=先手の石, 2=後手の石）を、
-    現在手番の視点（1=自分, 2=相手）に変換する。
-    """
-    if stone == 1:
-        return board.copy()
-    # 後手視点: 1↔2を入れ替え
-    view = board.copy()
-    view[board == 1] = 2
-    view[board == 2] = 1
-    return view
 
 
 # ── 動作確認 ─────────────────────────────────────────────────
@@ -127,5 +106,5 @@ if __name__ == "__main__":
 
     if samples:
         s = samples[0]
-        print(f"  最初の局面: 先手={s.is_first_player}, value={s.value:.1f}")
-        print(f"  mcts_probs shape={s.mcts_probs.shape}, sum={s.mcts_probs.sum():.4f}")
+        print(f"  最初の局面: to_play={s.to_play}, value={s.value:.1f}")
+        print(f"  mcts_probs sum={s.mcts_probs.sum():.4f}")

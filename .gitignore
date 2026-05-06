@@ -4,8 +4,8 @@ python/__pycache__/
 python/*.pyc
 
 # モデル（サイズが大きいためGit管理外）
-models/model.bin
-models/*.bin
+models/*
+!models/.gitkeep
 
 # Rust
 rust/target/

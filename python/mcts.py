@@ -1,13 +1,11 @@
 """
-MCTS (Monte Carlo Tree Search) - AlphaZero方式
+MCTS (AlphaZero方式) - 修正版
 
-選択式 (PUCT):
-    UCB(s, a) = Q(s,a) + c_puct * P(s,a) * sqrt(N(s)) / (1 + N(s,a))
-
-    Q: 平均価値（勝率）
-    P: NNのPolicyによる事前確率
-    N: 親ノードの訪問回数
-    c_puct: 探索度合いの定数
+設計:
+  ・盤面は常に「黒=1, 白=2」のまま扱う（視点変換しない）
+  ・各ノードは「次に打つ側 to_play」を保持する
+  ・NN呼び出し時にboard_to_tensor(board, to_play)で視点変換
+  ・backpropは標準実装（reverseしながら符号反転、加算前に反転）
 """
 
 import math
@@ -15,10 +13,11 @@ from typing import Optional
 
 import numpy as np
 import torch
+
 from network import BOARD_SIZE, GomokuNet
 
-C_PUCT = 1.5  # 探索の強さ（大きいほど未探索を優先）
-N_SIMULATIONS = 200  # 1手あたりのシミュレーション回数
+C_PUCT = 1.5
+N_SIMULATIONS = 200
 
 
 # ── 盤面ユーティリティ ────────────────────────────────────────
@@ -27,7 +26,6 @@ DIRECTIONS = [(0, 1), (1, 0), (1, 1), (1, -1)]
 
 
 def check_winner(board: np.ndarray, row: int, col: int, stone: int) -> bool:
-    """指定マスを起点に5連があるか確認"""
     for dr, dc in DIRECTIONS:
         count = 1
         for sign in (1, -1):
@@ -55,11 +53,9 @@ def get_legal_moves(board: np.ndarray) -> list[int]:
 
 
 class Node:
-    """MCTSの1ノード = 1局面"""
-
     __slots__ = (
         "board",
-        "stone",
+        "to_play",
         "parent",
         "move",
         "children",
@@ -71,34 +67,31 @@ class Node:
 
     def __init__(
         self,
-        board: np.ndarray,  # shape (15,15)  0=空 1=先手 2=後手
-        stone: int,  # このノードで手を打つ側: 1 or 2
+        board: np.ndarray,  # shape (15,15)  0=空 1=黒 2=白
+        to_play: int,  # このノードで打つ側: 1=黒 or 2=白
         parent: Optional["Node"] = None,
-        move: Optional[int] = None,  # 親から来た手（フラットインデックス）
-        prior: float = 0.0,  # NNのPolicy値
+        move: Optional[int] = None,
+        prior: float = 0.0,
     ):
         self.board = board
-        self.stone = stone
+        self.to_play = to_play
         self.parent = parent
         self.move = move
-        self.children: dict[int, "Node"] = {}  # move → Node
+        self.children: dict[int, "Node"] = {}
 
-        self.P = prior  # 事前確率（NNから）
-        self.N = 0  # 訪問回数
-        self.W = 0.0  # 累計価値
+        self.P = prior
+        self.N = 0
+        self.W = 0.0
         self.is_expanded = False
 
     @property
     def Q(self) -> float:
-        """平均価値"""
         return self.W / self.N if self.N > 0 else 0.0
 
     def ucb(self, parent_n: int) -> float:
-        """PUCT スコア"""
         return self.Q + C_PUCT * self.P * math.sqrt(parent_n) / (1 + self.N)
 
     def best_child(self) -> "Node":
-        """UCBが最大の子を返す"""
         parent_n = self.N
         return max(self.children.values(), key=lambda c: c.ucb(parent_n))
 
@@ -117,20 +110,17 @@ class MCTS:
         self.device = device
         self.n_sim = n_sim
 
-    # ── メインAPI ───────────────────────────────────────────
-
     def get_action_probs(
         self,
         board: np.ndarray,
-        stone: int,
+        to_play: int,
         temperature: float = 1.0,
     ) -> np.ndarray:
         """
         盤面を受け取り、225マス分の着手確率を返す。
-        temperature=1.0: 訪問回数に比例（学習時）
-        temperature→0  : 最多訪問手に集中（対局時）
+        boardは黒=1,白=2 のままでOK。to_playが次に打つ側。
         """
-        root = Node(board.copy(), stone)
+        root = Node(board.copy(), to_play)
         self._expand(root)
 
         for _ in range(self.n_sim):
@@ -141,74 +131,75 @@ class MCTS:
             counts[move] = child.N
 
         if temperature == 0:
-            # 最多訪問手だけ確率1
             probs = np.zeros_like(counts)
             probs[np.argmax(counts)] = 1.0
         else:
             counts = counts ** (1.0 / temperature)
-            probs = counts / counts.sum()
+            s = counts.sum()
+            if s > 0:
+                probs = counts / s
+            else:
+                probs = np.ones_like(counts) / len(counts)
 
         return probs
 
-    def best_move(self, board: np.ndarray, stone: int) -> int:
-        """最善手のフラットインデックスを返す（対局用）"""
-        probs = self.get_action_probs(board, stone, temperature=0)
+    def best_move(self, board: np.ndarray, to_play: int) -> int:
+        probs = self.get_action_probs(board, to_play, temperature=0)
         return int(np.argmax(probs))
 
     # ── 内部処理 ────────────────────────────────────────────
 
-    def _simulate(self, node: Node) -> None:
-        """Selection → Expansion → Backpropagation"""
-        path = []
+    def _simulate(self, root: Node) -> None:
+        """Selection → Expansion or 終局 → Backpropagation"""
+        path = [root]  # ★ ルートも含める
 
-        # Selection: 葉ノードまで降りる
-        current = node
+        # Selection: 葉まで降りる
+        current = root
         while not current.is_leaf():
             current = current.best_child()
             path.append(current)
 
-        # 終局チェック（直前の手で勝敗がついているか）
+        # 終局チェック: 直前の手で勝ち負けが決まっているか
+        # current.to_play が「これから打つ側」なので、直前に打ったのは相手
         last_move = current.move
         if last_move is not None:
             r, c = divmod(last_move, BOARD_SIZE)
-            # current.stone は「これから打つ側」なので相手石を確認
-            last_stone = 3 - current.stone
+            last_stone = 3 - current.to_play
             if check_winner(current.board, r, c, last_stone):
-                # 負け局面: 打った側から見て -1
+                # 直前手で勝敗確定 → 「これから打つ側(current.to_play)」から見て -1
                 value = -1.0
                 self._backprop(path, value)
                 return
 
-        if np.all(current.board != 0):
+        if not get_legal_moves(current.board):
             # 引き分け
             self._backprop(path, 0.0)
             return
 
-        # Expansion + NNによる評価
+        # Expansion + NN評価
         value = self._expand(current)
         self._backprop(path, value)
 
     def _expand(self, node: Node) -> float:
         """
-        ノードを展開してNNで評価。
-        Valueを返す（現在の手番から見た勝率）。
+        ノードを展開してNN評価。
+        Returns: node.to_play の視点から見た価値 [-1, 1]
         """
-        is_first = node.stone == 1
-        x = GomokuNet.board_to_tensor(node.board, is_first, self.device)
+        x = GomokuNet.board_to_tensor(node.board, node.to_play, self.device)
 
         self.net.eval()
         with torch.no_grad():
             policy, value = self.net(x)
 
-        policy = policy[0].cpu().numpy()  # (225,)
-        value = value[0].item()  # スカラー
+        policy = policy[0].cpu().numpy()
+        value = value[0].item()
 
-        # 合法手のみに絞ってPolicy再正規化
         legal = get_legal_moves(node.board)
         if not legal:
             node.is_expanded = True
             return value
 
+        # 合法手のみで再正規化
         mask = np.zeros(BOARD_SIZE * BOARD_SIZE)
         mask[legal] = 1.0
         policy = policy * mask
@@ -216,21 +207,19 @@ class MCTS:
         if s > 0:
             policy /= s
         else:
-            # 全て0になった場合は一様分布
             policy[legal] = 1.0 / len(legal)
 
-        # 子ノードを生成
-        next_stone = 3 - node.stone
-        for move in legal:
-            r, c = divmod(move, BOARD_SIZE)
+        next_to_play = 3 - node.to_play
+        for m in legal:
+            r, c = divmod(m, BOARD_SIZE)
             new_board = node.board.copy()
-            new_board[r][c] = node.stone
-            node.children[move] = Node(
+            new_board[r][c] = node.to_play  # ★ 黒なら黒石、白なら白石（視点変換しない）
+            node.children[m] = Node(
                 board=new_board,
-                stone=next_stone,
+                to_play=next_to_play,
                 parent=node,
-                move=move,
-                prior=float(policy[move]),
+                move=m,
+                prior=float(policy[m]),
             )
 
         node.is_expanded = True
@@ -238,13 +227,23 @@ class MCTS:
 
     def _backprop(self, path: list[Node], value: float) -> None:
         """
-        価値を逆伝播する。
-        手番が交互なので1つ上に戻るたびに符号を反転。
+        AlphaZero標準のbackprop:
+          末端ノードは「自分の視点」で価値を保持
+          親に上がるたびに視点が反転（手番交代）
+
+        valueは「path末端のto_playから見た価値」として渡される。
+        各ノード node に対して: node.W += (nodeのto_play視点での価値)
+        nodeを上がるたびに視点反転。
         """
+        # 末端から順に更新（reversedでルートに向かう）
+        # 末端ノード自身は「次にそのノードのto_playが打つ」位置
+        # value は「末端のto_play視点」なので、末端で W += value
+        # 1つ親に上がると視点が反転する
+        v = value
         for node in reversed(path):
             node.N += 1
-            node.W += value
-            value = -value  # 手番交代で視点が反転
+            node.W += v
+            v = -v
 
 
 # ── 動作確認 ─────────────────────────────────────────────────
@@ -254,20 +253,11 @@ if __name__ == "__main__":
     net = GomokuNet()
     mcts = MCTS(net, device, n_sim=50)
 
-    # 空盤面から1手選ばせる
+    # 黒が天元に打った状態 → 白の番
     board = np.zeros((BOARD_SIZE, BOARD_SIZE), dtype=np.int8)
-    board[7][7] = 1  # 先手が天元に打った後
-    stone = 2  # 後手の番
+    board[7][7] = 1  # 黒
 
-    print("盤面（7,7に先手の石）から後手の最善手を探索中...")
-    move = mcts.best_move(board, stone)
+    print("黒が(7,7)に打った後、白(後手)の最善手を探索...")
+    move = mcts.best_move(board, to_play=2)
     r, c = divmod(move, BOARD_SIZE)
-    print(f"最善手: ({c}, {r})  [フラットindex={move}]")
-
-    # 学習用の確率分布も確認
-    probs = mcts.get_action_probs(board, stone, temperature=1.0)
-    top3 = np.argsort(probs)[-3:][::-1]
-    print("Top-3 着手確率:")
-    for idx in top3:
-        r2, c2 = divmod(idx, BOARD_SIZE)
-        print(f"  ({c2}, {r2}): {probs[idx]:.4f}")
+    print(f"白の最善手: ({c}, {r})")
