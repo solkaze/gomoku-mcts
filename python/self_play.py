@@ -12,7 +12,6 @@ from typing import NamedTuple
 
 import numpy as np
 import torch
-
 from config import Config
 from mcts import MCTS, check_winner, get_legal_moves
 from network import BOARD_SIZE, GomokuNet
@@ -32,7 +31,14 @@ def play_one_game(
 ) -> list[GameSample]:
     """1局自己対局して、学習サンプルのリストを返す"""
 
-    mcts = MCTS(net, device, n_sim=cfg.n_simulations)
+    mcts = MCTS(
+        net,
+        device,
+        n_sim=cfg.n_simulations,
+        dirichlet_alpha=cfg.dirichlet_alpha,
+        dirichlet_eps=cfg.dirichlet_eps,
+        add_noise=True,  # 自己対局では探索の多様性を確保
+    )
 
     board = np.zeros((BOARD_SIZE, BOARD_SIZE), dtype=np.int8)
     to_play = 1  # 黒(先手)から開始

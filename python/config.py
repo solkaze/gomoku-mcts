@@ -14,7 +14,7 @@ class Config:
     num_res_blocks: int = 5
 
     # ── MCTS ─────────────────────────────────────────
-    n_simulations: int = 200  # 1手あたりの探索回数
+    n_simulations: int = 400  # 1手あたりの探索回数
     c_puct: float = 1.5
     dirichlet_alpha: float = 0.3  # 探索の多様性（ルートにのみ加算）
     dirichlet_eps: float = 0.25  # ノイズの混合率

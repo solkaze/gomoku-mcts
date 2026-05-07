@@ -13,7 +13,6 @@ from typing import Optional
 
 import numpy as np
 import torch
-
 from network import BOARD_SIZE, GomokuNet
 
 C_PUCT = 1.5
@@ -104,11 +103,20 @@ class Node:
 
 class MCTS:
     def __init__(
-        self, net: GomokuNet, device: torch.device, n_sim: int = N_SIMULATIONS
+        self,
+        net: GomokuNet,
+        device: torch.device,
+        n_sim: int = N_SIMULATIONS,
+        dirichlet_alpha: float = 0.3,
+        dirichlet_eps: float = 0.25,
+        add_noise: bool = True,
     ):
         self.net = net
         self.device = device
         self.n_sim = n_sim
+        self.dirichlet_alpha = dirichlet_alpha
+        self.dirichlet_eps = dirichlet_eps
+        self.add_noise = add_noise
 
     def get_action_probs(
         self,
@@ -122,6 +130,11 @@ class MCTS:
         """
         root = Node(board.copy(), to_play)
         self._expand(root)
+
+        # ルートノードの子のpriorにDirichletノイズを加える（AlphaZero標準）
+        # これによりMCTSが多様な手を探索し、未知の局面で防御手などを発見しやすくなる
+        if self.add_noise and root.children:
+            self._add_dirichlet_noise(root)
 
         for _ in range(self.n_sim):
             self._simulate(root)
@@ -146,6 +159,18 @@ class MCTS:
     def best_move(self, board: np.ndarray, to_play: int) -> int:
         probs = self.get_action_probs(board, to_play, temperature=0)
         return int(np.argmax(probs))
+
+    def _add_dirichlet_noise(self, root: "Node") -> None:
+        """ルートの子ノードのpriorにDirichletノイズを混合する"""
+        moves = list(root.children.keys())
+        n = len(moves)
+        if n == 0:
+            return
+        noise = np.random.dirichlet([self.dirichlet_alpha] * n)
+        eps = self.dirichlet_eps
+        for i, m in enumerate(moves):
+            child = root.children[m]
+            child.P = (1 - eps) * child.P + eps * float(noise[i])
 
     # ── 内部処理 ────────────────────────────────────────────
 
