@@ -17,7 +17,7 @@ class Config:
     n_simulations: int = 400  # 1手あたりの探索回数
     c_puct: float = 1.5
     dirichlet_alpha: float = 0.3  # 探索の多様性（ルートにのみ加算）
-    dirichlet_eps: float = 0.25  # ノイズの混合率
+    dirichlet_eps: float = 0.10  # ノイズの混合率
 
     # ── 自己対局 ─────────────────────────────────────
     games_per_iteration: int = 50  # 1イテレーションあたりの対局数
