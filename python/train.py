@@ -6,26 +6,26 @@
 
 import os
 import time
-from pathlib import Path
-
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from config import DEFAULT, Config
-from dataset import ReplayBuffer
-from network import GomokuNet
-from self_play import play_one_game
-from stats import TrainingStats
 from torch.utils.data import DataLoader
+from pathlib import Path
+
+from network import GomokuNet
+from self_play import play_games_parallel
+from dataset import ReplayBuffer
+from config import Config, DEFAULT
+from stats import TrainingStats
+
 
 # ── 損失関数 ────────────────────────────────────────────────
 
-
 def alphazero_loss(
     pred_policy: torch.Tensor,  # (B, 225) softmax済み
-    pred_value: torch.Tensor,  # (B, 1)   tanh済み
+    pred_value:  torch.Tensor,  # (B, 1)   tanh済み
     target_policy: torch.Tensor,  # (B, 225) MCTS確率
-    target_value: torch.Tensor,  # (B, 1)   勝敗 [-1, 0, 1]
+    target_value:  torch.Tensor,  # (B, 1)   勝敗 [-1, 0, 1]
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Loss = MSE(value) + CrossEntropy(policy)
@@ -42,7 +42,6 @@ def alphazero_loss(
 
 # ── 1イテレーション ─────────────────────────────────────────
 
-
 def run_iteration(
     net: GomokuNet,
     optimizer: optim.Optimizer,
@@ -57,18 +56,19 @@ def run_iteration(
     """
     stats = {}
 
-    # ── ① 自己対局 ───────────────────────────────────────
+    # ── ① 自己対局（並列バッチ実行）─────────────────────
     t0 = time.time()
     new_samples = 0
-    for game_idx in range(cfg.games_per_iteration):
-        samples = play_one_game(net, cfg, device)
+    games_done = 0
+    # games_per_iteration 局を parallel_games 単位のバッチに分けて実行
+    while games_done < cfg.games_per_iteration:
+        batch_size = min(cfg.parallel_games, cfg.games_per_iteration - games_done)
+        samples = play_games_parallel(net, cfg, device, n_games=batch_size)
         buffer.add_samples(samples, augment=True)
         new_samples += len(samples)
-        if (game_idx + 1) % 10 == 0:
-            elapsed = time.time() - t0
-            print(
-                f"  [self-play] {game_idx + 1}/{cfg.games_per_iteration} games ({elapsed:.1f}s)"
-            )
+        games_done += batch_size
+        elapsed = time.time() - t0
+        print(f"  [self-play] {games_done}/{cfg.games_per_iteration} games ({elapsed:.1f}s)")
 
     stats["self_play_time"] = time.time() - t0
     stats["new_samples"] = new_samples
@@ -76,9 +76,7 @@ def run_iteration(
 
     # 学習可能なサイズに達していなければスキップ
     if len(buffer) < cfg.batch_size:
-        print(
-            f"  バッファサイズ不足（{len(buffer)} < {cfg.batch_size}）。学習スキップ。"
-        )
+        print(f"  バッファサイズ不足（{len(buffer)} < {cfg.batch_size}）。学習スキップ。")
         return stats
 
     # ── ② 学習 ───────────────────────────────────────────
@@ -135,11 +133,8 @@ def run_iteration(
 
 # ── メインループ ────────────────────────────────────────────
 
-
 def main(cfg: Config = DEFAULT) -> None:
-    device = torch.device(
-        cfg.device if torch.cuda.is_available() or cfg.device == "cpu" else "cpu"
-    )
+    device = torch.device(cfg.device if torch.cuda.is_available() or cfg.device == "cpu" else "cpu")
     print(f"Device: {device}")
     if device.type == "cuda":
         print(f"  GPU: {torch.cuda.get_device_name(0)}")
@@ -169,7 +164,6 @@ def main(cfg: Config = DEFAULT) -> None:
 
     # バッファの読み込み（既存ファイルがあれば復元）
     from pathlib import Path as _Path
-
     if _Path(cfg.buffer_path).exists():
         buffer = ReplayBuffer.load(cfg.buffer_path)
         print(f"バッファを復元: {len(buffer):,} サンプル")
@@ -190,16 +184,12 @@ def main(cfg: Config = DEFAULT) -> None:
     remaining = cfg.num_iterations
 
     if already_done > 0:
-        print(
-            f"\n累計 {already_done} イテレーション完了済み。"
-            f"{remaining} イテレーション追加します（目標合計: {target_total}）。"
-        )
+        print(f"\n累計 {already_done} イテレーション完了済み。"
+              f"{remaining} イテレーション追加します（目標合計: {target_total}）。")
 
     for iter_idx in range(1, remaining + 1):
         global_iter = stats_all.total_iterations + 1
-        print(
-            f"\n=== Iteration {iter_idx}/{remaining}  (global #{global_iter} / 目標{target_total}) ==="
-        )
+        print(f"\n=== Iteration {iter_idx}/{remaining}  (global #{global_iter} / 目標{target_total}) ===")
         stats = run_iteration(net, optimizer, buffer, cfg, device, iter_idx)
 
         # 統計を更新
@@ -214,19 +204,13 @@ def main(cfg: Config = DEFAULT) -> None:
             stats_all.last_value_loss = stats["value_loss"]
             stats_all.loss_history.append(stats["loss"])
 
-        print(
-            f"  buffer={stats['buffer_size']:6d}  new={stats.get('new_samples', 0):4d}"
-            f"  self-play={stats.get('self_play_time', 0):.1f}s"
-        )
+        print(f"  buffer={stats['buffer_size']:6d}  new={stats.get('new_samples', 0):4d}"
+              f"  self-play={stats.get('self_play_time', 0):.1f}s")
         if stats.get("loss") is not None:
-            print(
-                f"  loss={stats['loss']:.4f}  policy={stats['policy_loss']:.4f}"
-                f"  value={stats['value_loss']:.4f}  train={stats['train_time']:.1f}s"
-            )
-        print(
-            f"  [累計] 対局={stats_all.total_games:,}局  "
-            f"イテレーション={stats_all.total_iterations}"
-        )
+            print(f"  loss={stats['loss']:.4f}  policy={stats['policy_loss']:.4f}"
+                  f"  value={stats['value_loss']:.4f}  train={stats['train_time']:.1f}s")
+        print(f"  [累計] 対局={stats_all.total_games:,}局  "
+              f"イテレーション={stats_all.total_iterations}")
 
         # モデル・統計・バッファを保存
         net.save_binary(cfg.model_path)
@@ -241,10 +225,7 @@ def main(cfg: Config = DEFAULT) -> None:
                 print(f"  best_model更新: loss={stats['loss']:.4f}")
 
         if iter_idx % 10 == 0:
-            ckpt = (
-                Path(cfg.checkpoint_dir)
-                / f"model_iter{stats_all.total_iterations:04d}.bin"
-            )
+            ckpt = Path(cfg.checkpoint_dir) / f"model_iter{stats_all.total_iterations:04d}.bin"
             net.save_binary(str(ckpt))
 
     print("\n学習完了")

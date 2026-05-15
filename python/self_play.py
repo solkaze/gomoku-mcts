@@ -1,100 +1,110 @@
 """
-自己対局モジュール - 修正版
+自己対局モジュール - 並列バッチMCTS版
 
-設計:
-  ・盤面は常に「黒=1, 白=2」のまま保持
-  ・MCTS呼び出し時に to_play を渡すだけ
-  ・GameSampleには (盤面, to_play, mcts_probs, value) を保存
-  ・valueはその局面の「to_play視点」での最終勝敗
+複数の対局を同時進行させ、各手のMCTSをバッチ推論で高速化する。
+全ゲームが「次の1手」を同時に決めるように進行する。
 """
-
-from typing import NamedTuple
 
 import numpy as np
 import torch
+from typing import NamedTuple
+from network import GomokuNet, BOARD_SIZE
+from parallel_mcts import ParallelMCTS
+from mcts import check_winner, get_legal_moves
 from config import Config
-from mcts import MCTS, check_winner, get_legal_moves
-from network import BOARD_SIZE, GomokuNet
 
 
 class GameSample(NamedTuple):
-    """学習用の1局面サンプル"""
-
-    board: np.ndarray  # (15, 15) int8: 0=空, 1=黒, 2=白（生の盤面）
-    to_play: int  # この局面で打つ側: 1=黒 or 2=白
+    board: np.ndarray       # (15, 15) int8: 0=空, 1=黒, 2=白
+    to_play: int            # この局面で打つ側: 1=黒 or 2=白
     mcts_probs: np.ndarray  # (225,) MCTSの着手確率
-    value: float  # to_play視点での最終勝敗 [-1, 1]
+    value: float            # to_play視点での最終勝敗 [-1, 1]
 
 
-def play_one_game(
-    net: GomokuNet, cfg: Config, device: torch.device
+class _GameState:
+    """並列対局の1ゲーム分の進行状態"""
+    def __init__(self):
+        self.board = np.zeros((BOARD_SIZE, BOARD_SIZE), dtype=np.int8)
+        self.to_play = 1  # 黒から
+        self.history: list[tuple[np.ndarray, int, np.ndarray]] = []
+        self.finished = False
+        self.winner = 0  # 0=引き分け, 1=黒, 2=白
+        self.move_count = 0
+
+
+def play_games_parallel(
+    net: GomokuNet,
+    cfg: Config,
+    device: torch.device,
+    n_games: int,
 ) -> list[GameSample]:
-    """1局自己対局して、学習サンプルのリストを返す"""
-
-    mcts = MCTS(
-        net,
-        device,
+    """
+    n_games 局を並列に自己対局し、全局面の学習サンプルをまとめて返す。
+    """
+    pmcts = ParallelMCTS(
+        net, device,
         n_sim=cfg.n_simulations,
         dirichlet_alpha=cfg.dirichlet_alpha,
         dirichlet_eps=cfg.dirichlet_eps,
-        add_noise=True,  # 自己対局では探索の多様性を確保
+        add_noise=True,
     )
 
-    board = np.zeros((BOARD_SIZE, BOARD_SIZE), dtype=np.int8)
-    to_play = 1  # 黒(先手)から開始
+    games = [_GameState() for _ in range(n_games)]
 
-    # (盤面, to_play, mcts_probs) を一時保存
-    history: list[tuple[np.ndarray, int, np.ndarray]] = []
-
-    winner = 0  # 0=引き分け, 1=黒勝ち, 2=白勝ち
-
-    for move_count in range(cfg.max_moves):
-        if move_count < cfg.temperature_threshold:
-            temp = 1.0
-        else:
-            temp = 0.0
-
-        # MCTSで着手確率を取得（盤面は生のまま渡す）
-        probs = mcts.get_action_probs(board, to_play=to_play, temperature=temp)
-
-        history.append((board.copy(), to_play, probs))
-
-        legal = get_legal_moves(board)
-        if not legal:
+    for move_idx in range(cfg.max_moves):
+        # まだ終わっていないゲームを集める
+        active = [g for g in games if not g.finished]
+        if not active:
             break
 
-        if temp == 0.0:
-            move = int(np.argmax(probs))
-        else:
-            move = int(np.random.choice(len(probs), p=probs))
+        # 温度設定（全ゲーム共通）
+        temp = 1.0 if move_idx < cfg.temperature_threshold else 0.0
 
-        r, c = divmod(move, BOARD_SIZE)
-        board[r][c] = to_play  # 黒なら1、白なら2 を直接置く
+        # アクティブゲームの盤面をまとめてMCTS
+        boards = [g.board for g in active]
+        to_plays = [g.to_play for g in active]
+        probs_list = pmcts.get_action_probs_batch(boards, to_plays, temperature=temp)
 
-        if check_winner(board, r, c, to_play):
-            winner = to_play
-            break
+        # 各ゲームで着手
+        for g, probs in zip(active, probs_list):
+            g.history.append((g.board.copy(), g.to_play, probs.astype(np.float32)))
 
-        to_play = 3 - to_play
+            legal = get_legal_moves(g.board)
+            if not legal:
+                g.finished = True
+                continue
 
-    # 各サンプルに勝敗結果を割り当て（to_play視点でのvalue）
+            if temp == 0.0:
+                move = int(np.argmax(probs))
+            else:
+                move = int(np.random.choice(len(probs), p=probs))
+
+            r, c = divmod(move, BOARD_SIZE)
+            g.board[r][c] = g.to_play
+
+            if check_winner(g.board, r, c, g.to_play):
+                g.winner = g.to_play
+                g.finished = True
+            else:
+                g.to_play = 3 - g.to_play
+            g.move_count += 1
+
+    # ── 全ゲームの履歴からサンプルを生成 ──────────────────
     samples: list[GameSample] = []
-    for hist_board, hist_to_play, hist_probs in history:
-        if winner == 0:
-            value = 0.0
-        elif winner == hist_to_play:
-            value = 1.0
-        else:
-            value = -1.0
-
-        samples.append(
-            GameSample(
+    for g in games:
+        for hist_board, hist_to_play, hist_probs in g.history:
+            if g.winner == 0:
+                value = 0.0
+            elif g.winner == hist_to_play:
+                value = 1.0
+            else:
+                value = -1.0
+            samples.append(GameSample(
                 board=hist_board,
                 to_play=hist_to_play,
-                mcts_probs=hist_probs.astype(np.float32),
+                mcts_probs=hist_probs,
                 value=value,
-            )
-        )
+            ))
 
     return samples
 
@@ -102,15 +112,19 @@ def play_one_game(
 # ── 動作確認 ─────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    cfg = Config(n_simulations=20, temperature_threshold=10, max_moves=30, device="cpu")
+    cfg = Config(
+        n_simulations=20, temperature_threshold=10, max_moves=30, device="cpu"
+    )
     device = torch.device(cfg.device)
     net = GomokuNet().to(device)
 
-    print("自己対局を1局実行...")
-    samples = play_one_game(net, cfg, device)
-    print(f"集めたサンプル数: {len(samples)}")
+    print("4ゲーム並列で自己対局...")
+    import time
+    t0 = time.time()
+    samples = play_games_parallel(net, cfg, device, n_games=4)
+    elapsed = time.time() - t0
+    print(f"集めたサンプル数: {len(samples)}  ({elapsed:.1f}秒)")
 
     if samples:
         s = samples[0]
         print(f"  最初の局面: to_play={s.to_play}, value={s.value:.1f}")
-        print(f"  mcts_probs sum={s.mcts_probs.sum():.4f}")
