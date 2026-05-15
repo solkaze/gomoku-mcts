@@ -9,13 +9,12 @@ GomokuNet: Policy + Value の2ヘッド構成
   value:  (batch, 1)    tanh済み勝率 [-1, 1]
 """
 
-import struct
-from pathlib import Path
-
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import numpy as np
+import struct
+from pathlib import Path
 
 BOARD_SIZE = 15
 IN_CHANNELS = 3
@@ -25,13 +24,12 @@ NUM_RES_BLOCKS = 5
 
 class ResBlock(nn.Module):
     """残差ブロック: Conv → BN → ReLU → Conv → BN → residual加算 → ReLU"""
-
     def __init__(self, filters: int):
         super().__init__()
         self.conv1 = nn.Conv2d(filters, filters, 3, padding=1, bias=False)
-        self.bn1 = nn.BatchNorm2d(filters)
+        self.bn1   = nn.BatchNorm2d(filters)
         self.conv2 = nn.Conv2d(filters, filters, 3, padding=1, bias=False)
-        self.bn2 = nn.BatchNorm2d(filters)
+        self.bn2   = nn.BatchNorm2d(filters)
 
     def forward(self, x):
         residual = x
@@ -43,10 +41,10 @@ class ResBlock(nn.Module):
 class GomokuNet(nn.Module):
     def __init__(
         self,
-        in_channels: int = IN_CHANNELS,
-        filters: int = NUM_FILTERS,
-        res_blocks: int = NUM_RES_BLOCKS,
-        board_size: int = BOARD_SIZE,
+        in_channels:  int = IN_CHANNELS,
+        filters:      int = NUM_FILTERS,
+        res_blocks:   int = NUM_RES_BLOCKS,
+        board_size:   int = BOARD_SIZE,
     ):
         super().__init__()
         self.board_size = board_size
@@ -61,14 +59,14 @@ class GomokuNet(nn.Module):
 
         # ── Policy Head ────────────────────────────
         self.policy_conv = nn.Conv2d(filters, 2, 1, bias=False)
-        self.policy_bn = nn.BatchNorm2d(2)
-        self.policy_fc = nn.Linear(2 * board_size * board_size, board_size * board_size)
+        self.policy_bn   = nn.BatchNorm2d(2)
+        self.policy_fc   = nn.Linear(2 * board_size * board_size, board_size * board_size)
 
         # ── Value Head ─────────────────────────────
         self.value_conv = nn.Conv2d(filters, 1, 1, bias=False)
-        self.value_bn = nn.BatchNorm2d(1)
-        self.value_fc1 = nn.Linear(board_size * board_size, 64)
-        self.value_fc2 = nn.Linear(64, 1)
+        self.value_bn   = nn.BatchNorm2d(1)
+        self.value_fc1  = nn.Linear(board_size * board_size, 64)
+        self.value_fc2  = nn.Linear(64, 1)
 
     def forward(self, x):
         x = self.stem(x)
@@ -92,8 +90,8 @@ class GomokuNet(nn.Module):
 
     @staticmethod
     def board_to_tensor(
-        board: np.ndarray,  # shape (15,15)  0=空, 1=黒, 2=白
-        to_play: int,  # 次に打つ側: 1=黒(先手), 2=白(後手)
+        board: np.ndarray,    # shape (15,15)  0=空, 1=黒, 2=白
+        to_play: int,         # 次に打つ側: 1=黒(先手), 2=白(後手)
         device: torch.device | None = None,
     ) -> torch.Tensor:
         """
@@ -108,9 +106,34 @@ class GomokuNet(nn.Module):
         opp = 3 - to_play  # 1↔2
         ch0 = (board == to_play).astype(np.float32)
         ch1 = (board == opp).astype(np.float32)
-        is_first = to_play == 1
+        is_first = (to_play == 1)
         ch2 = np.ones_like(ch0) if is_first else np.zeros_like(ch0)
         tensor = torch.from_numpy(np.stack([ch0, ch1, ch2], axis=0)).unsqueeze(0)
+        if device is not None:
+            tensor = tensor.to(device)
+        return tensor
+
+    @staticmethod
+    def batch_to_tensor(
+        boards: list[np.ndarray],   # 各 shape (15,15)
+        to_plays: list[int],        # 各 1=黒 or 2=白
+        device: torch.device | None = None,
+    ) -> torch.Tensor:
+        """
+        複数の盤面をまとめて (N, 3, 15, 15) のテンソルに変換する。
+        並列MCTSで複数局面を一度に推論するために使う。
+        """
+        n = len(boards)
+        assert n == len(to_plays), "boardsとto_playsの長さが一致しません"
+
+        batch = np.empty((n, 3, boards[0].shape[0], boards[0].shape[1]), dtype=np.float32)
+        for i, (board, to_play) in enumerate(zip(boards, to_plays)):
+            opp = 3 - to_play
+            batch[i, 0] = (board == to_play).astype(np.float32)
+            batch[i, 1] = (board == opp).astype(np.float32)
+            batch[i, 2] = 1.0 if to_play == 1 else 0.0
+
+        tensor = torch.from_numpy(batch)
         if device is not None:
             tensor = tensor.to(device)
         return tensor
@@ -163,9 +186,7 @@ class GomokuNet(nn.Module):
         print(f"Saved {num_layers} layers, {total_params:,} params → {path}")
 
     @classmethod
-    def load_binary(
-        cls, path: str | Path, device: torch.device | None = None
-    ) -> "GomokuNet":
+    def load_binary(cls, path: str | Path, device: torch.device | None = None) -> "GomokuNet":
         """独自バイナリから重みを復元する"""
         path = Path(path)
         model = cls()
@@ -187,9 +208,7 @@ class GomokuNet(nn.Module):
                 num_elems = 1
                 for s in shape:
                     num_elems *= s
-                data = np.frombuffer(f.read(num_elems * 4), dtype=np.float32).reshape(
-                    shape
-                )
+                data = np.frombuffer(f.read(num_elems * 4), dtype=np.float32).reshape(shape)
                 state[name] = torch.from_numpy(data.copy())
 
         model.load_state_dict(state)
