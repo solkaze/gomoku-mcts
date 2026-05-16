@@ -1,35 +1,31 @@
 """
-自己対局モジュール - 並列バッチMCTS版
+自己対局モジュール - マルチプロセス版
 
-複数の対局を同時進行させ、各手のMCTSをバッチ推論で高速化する。
-全ゲームが「次の1手」を同時に決めるように進行する。
+複数のワーカープロセスで自己対局を並列実行し、
+GPU推論は専属の推論サーバープロセスで一括処理する。
+
+構造:
+  推論サーバープロセス × 1
+  ワーカープロセス × N (CPUコア活用)
 """
 
+import os
 import numpy as np
 import torch
+import torch.multiprocessing as mp
 from typing import NamedTuple
+
 from network import GomokuNet, BOARD_SIZE
-from parallel_mcts import ParallelMCTS
-from mcts import check_winner, get_legal_moves
+from inference_server import inference_server_loop, CMD_STOP
+from worker import worker_loop
 from config import Config
 
 
 class GameSample(NamedTuple):
-    board: np.ndarray       # (15, 15) int8: 0=空, 1=黒, 2=白
-    to_play: int            # この局面で打つ側: 1=黒 or 2=白
-    mcts_probs: np.ndarray  # (225,) MCTSの着手確率
-    value: float            # to_play視点での最終勝敗 [-1, 1]
-
-
-class _GameState:
-    """並列対局の1ゲーム分の進行状態"""
-    def __init__(self):
-        self.board = np.zeros((BOARD_SIZE, BOARD_SIZE), dtype=np.int8)
-        self.to_play = 1  # 黒から
-        self.history: list[tuple[np.ndarray, int, np.ndarray]] = []
-        self.finished = False
-        self.winner = 0  # 0=引き分け, 1=黒, 2=白
-        self.move_count = 0
+    board: np.ndarray
+    to_play: int
+    mcts_probs: np.ndarray
+    value: float
 
 
 def play_games_parallel(
@@ -39,92 +35,84 @@ def play_games_parallel(
     n_games: int,
 ) -> list[GameSample]:
     """
-    n_games 局を並列に自己対局し、全局面の学習サンプルをまとめて返す。
+    n_games 局をマルチプロセスで並列自己対局する。
     """
-    pmcts = ParallelMCTS(
-        net, device,
-        n_sim=cfg.n_simulations,
-        dirichlet_alpha=cfg.dirichlet_alpha,
-        dirichlet_eps=cfg.dirichlet_eps,
-        add_noise=True,
+    # ── モデルを一時ファイルに保存（ワーカープロセス間で共有用）─────
+    # netはメインプロセスのものなので、サーバープロセスは別途読み込む
+    tmp_model_path = "/tmp/_worker_model.bin"
+    net.save_binary(tmp_model_path)
+
+    # ── キューを準備 ────────────────────────────────────────
+    n_workers = cfg.num_workers
+    games_per_worker = (n_games + n_workers - 1) // n_workers
+
+    ctx = mp.get_context("spawn")
+    req_queue = ctx.Queue()
+    result_queues = {wid: ctx.Queue() for wid in range(n_workers)}
+    sample_queue = ctx.Queue()
+
+    # ── 推論サーバープロセスを起動 ──────────────────────────
+    server_proc = ctx.Process(
+        target=inference_server_loop,
+        args=(req_queue, result_queues, tmp_model_path, str(device)),
+        kwargs={"batch_wait_ms": cfg.infer_batch_wait_ms,
+                "max_batch_size": cfg.infer_max_batch},
     )
+    server_proc.start()
 
-    games = [_GameState() for _ in range(n_games)]
+    # ── ワーカープロセスを起動 ──────────────────────────────
+    worker_procs = []
+    for wid in range(n_workers):
+        # 各ワーカーが担当する局数（端数は最後のワーカーが調整）
+        my_games = games_per_worker if wid < n_workers - 1 else (n_games - games_per_worker * (n_workers - 1))
+        if my_games <= 0:
+            continue
+        p = ctx.Process(
+            target=worker_loop,
+            args=(wid, req_queue, result_queues[wid], sample_queue,
+                  my_games, cfg.n_simulations, cfg.parallel_inner,
+                  cfg.dirichlet_alpha, cfg.dirichlet_eps,
+                  cfg.temperature_threshold, cfg.max_moves),
+        )
+        p.start()
+        worker_procs.append((wid, p))
 
-    for move_idx in range(cfg.max_moves):
-        # まだ終わっていないゲームを集める
-        active = [g for g in games if not g.finished]
-        if not active:
-            break
+    # ── 結果を集める ────────────────────────────────────────
+    all_samples = []
+    workers_done = 0
+    n_active_workers = len(worker_procs)
+    while workers_done < n_active_workers:
+        wid, samples = sample_queue.get()
+        if samples is None:
+            workers_done += 1
+        else:
+            all_samples.extend(samples)
 
-        # 温度設定（全ゲーム共通）
-        temp = 1.0 if move_idx < cfg.temperature_threshold else 0.0
+    # ── 後片付け ───────────────────────────────────────────
+    for _, p in worker_procs:
+        p.join()
+    req_queue.put((CMD_STOP,))
+    server_proc.join(timeout=10)
+    if server_proc.is_alive():
+        server_proc.terminate()
 
-        # アクティブゲームの盤面をまとめてMCTS
-        boards = [g.board for g in active]
-        to_plays = [g.to_play for g in active]
-        probs_list = pmcts.get_action_probs_batch(boards, to_plays, temperature=temp)
-
-        # 各ゲームで着手
-        for g, probs in zip(active, probs_list):
-            g.history.append((g.board.copy(), g.to_play, probs.astype(np.float32)))
-
-            legal = get_legal_moves(g.board)
-            if not legal:
-                g.finished = True
-                continue
-
-            if temp == 0.0:
-                move = int(np.argmax(probs))
-            else:
-                move = int(np.random.choice(len(probs), p=probs))
-
-            r, c = divmod(move, BOARD_SIZE)
-            g.board[r][c] = g.to_play
-
-            if check_winner(g.board, r, c, g.to_play):
-                g.winner = g.to_play
-                g.finished = True
-            else:
-                g.to_play = 3 - g.to_play
-            g.move_count += 1
-
-    # ── 全ゲームの履歴からサンプルを生成 ──────────────────
-    samples: list[GameSample] = []
-    for g in games:
-        for hist_board, hist_to_play, hist_probs in g.history:
-            if g.winner == 0:
-                value = 0.0
-            elif g.winner == hist_to_play:
-                value = 1.0
-            else:
-                value = -1.0
-            samples.append(GameSample(
-                board=hist_board,
-                to_play=hist_to_play,
-                mcts_probs=hist_probs,
-                value=value,
-            ))
-
-    return samples
+    return all_samples
 
 
 # ── 動作確認 ─────────────────────────────────────────────────
 
 if __name__ == "__main__":
     cfg = Config(
-        n_simulations=20, temperature_threshold=10, max_moves=30, device="cpu"
+        n_simulations=10, max_moves=20, temperature_threshold=10,
+        num_workers=2, parallel_inner=2, device="cpu",
     )
     device = torch.device(cfg.device)
     net = GomokuNet().to(device)
 
-    print("4ゲーム並列で自己対局...")
+    print("4ゲームをマルチプロセスで実行...")
     import time
     t0 = time.time()
     samples = play_games_parallel(net, cfg, device, n_games=4)
     elapsed = time.time() - t0
     print(f"集めたサンプル数: {len(samples)}  ({elapsed:.1f}秒)")
-
-    if samples:
-        s = samples[0]
-        print(f"  最初の局面: to_play={s.to_play}, value={s.value:.1f}")
+    

@@ -56,19 +56,14 @@ def run_iteration(
     """
     stats = {}
 
-    # ── ① 自己対局（並列バッチ実行）─────────────────────
+    # ── ① 自己対局（マルチプロセス並列実行）─────────────
     t0 = time.time()
-    new_samples = 0
-    games_done = 0
-    # games_per_iteration 局を parallel_games 単位のバッチに分けて実行
-    while games_done < cfg.games_per_iteration:
-        batch_size = min(cfg.parallel_games, cfg.games_per_iteration - games_done)
-        samples = play_games_parallel(net, cfg, device, n_games=batch_size)
-        buffer.add_samples(samples, augment=True)
-        new_samples += len(samples)
-        games_done += batch_size
-        elapsed = time.time() - t0
-        print(f"  [self-play] {games_done}/{cfg.games_per_iteration} games ({elapsed:.1f}s)")
+    # 1回の呼び出しで全 games_per_iteration 局を num_workers プロセスで並列実行
+    samples = play_games_parallel(net, cfg, device, n_games=cfg.games_per_iteration)
+    buffer.add_samples(samples, augment=True)
+    new_samples = len(samples)
+    elapsed = time.time() - t0
+    print(f"  [self-play] {cfg.games_per_iteration} games 完了 ({elapsed:.1f}s)")
 
     stats["self_play_time"] = time.time() - t0
     stats["new_samples"] = new_samples

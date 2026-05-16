@@ -21,7 +21,12 @@ class Config:
 
     # ── 自己対局 ─────────────────────────────────────
     games_per_iteration: int = 50      # 1イテレーションあたりの対局数
-    parallel_games: int = 16           # 並列対局数（GPU効率化）
+    # ── マルチプロセス並列化 ─────────────────────────
+    num_workers: int = 12              # 自己対局ワーカープロセス数（CPUコア数に合わせる）
+    parallel_inner: int = 8            # 各ワーカー内で並列に進めるゲーム数
+    infer_batch_wait_ms: float = 2.0   # 推論サーバーがバッチを集める待機時間
+    infer_max_batch: int = 256         # 推論サーバーの最大バッチサイズ
+    parallel_games: int = 16           # 旧設定（互換用、未使用）
     temperature_threshold: int = 15    # この手数まで温度=1（探索）、以降は温度→0
     max_moves: int = 225               # 最大手数
 
