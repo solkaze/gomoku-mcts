@@ -14,7 +14,7 @@ class Config:
     num_res_blocks: int = 10
 
     # ── MCTS ─────────────────────────────────────────
-    n_simulations: int = 800
+    n_simulations: int = 400       # 800 → 400（CPU負荷の主因）
     c_puct: float = 1.5
     dirichlet_alpha: float = 0.3
     dirichlet_eps: float = 0.20
@@ -23,16 +23,16 @@ class Config:
     games_per_iteration: int = 50
 
     # ── マルチプロセス並列化 ─────────────────────────
-    num_workers: int = 16
-    parallel_inner: int = 32
+    num_workers: int = 8           # 16 → 8（プロセス数を半減）
+    parallel_inner: int = 16       # 32 → 16（スロット数を半減）
     infer_batch_wait_ms: float = 5.0
-    infer_max_batch: int = 1024
-    parallel_games: int = 16           # 旧設定（互換用、未使用）
+    infer_max_batch: int = 512
+    parallel_games: int = 16       # 旧設定（互換用、未使用）
     temperature_threshold: int = 15
     max_moves: int = 225
 
     # ── 学習 ─────────────────────────────────────────
-    batch_size: int = 512
+    batch_size: int = 256          # 512 → 256
     learning_rate: float = 3e-4
     weight_decay: float = 1e-4
     epochs_per_iteration: int = 3
