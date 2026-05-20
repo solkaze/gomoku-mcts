@@ -1,27 +1,41 @@
 """
-ワーカープロセス用MCTS
+ワーカープロセス用MCTS（Virtual Loss対応版）
 
-推論をInferenceClient経由で行う以外は、parallel_mcts.pyと同じ動作。
-1ワーカーが内部で複数ゲームを並列保持し、推論はサーバーに投げる。
+Virtual Lossの仕組み:
+  通常のMCTSは「葉まで降りる → 推論 → backprop」を1本ずつ逐次処理する。
+  これではGPUへのバッチが1件になり使用率が上がらない。
+
+  Virtual Lossは1シミュレーションステップで N_VL 本のパスを同時に降りる。
+    1. パスを降りるたびに通過ノードの N+=1, W-=1 を仮加算（Virtual Loss）
+       → UCBスコアが下がるので次の探索は別の経路を選ぶ
+    2. 全パスの葉が揃ったらまとめてGPU推論（大きいバッチ）
+    3. 実際の推論結果でbackprop し、Virtual Lossを除去
+
+  parallel_inner=32ゲーム × N_VL=8本 = 256件/バッチ が理論上限になる。
 """
 
-import math
 import numpy as np
-from typing import Optional
-from inference_server import InferenceClient
+from inference_server import InferenceClient, CMD_INFER
 from mcts import check_winner, get_legal_moves, Node, C_PUCT
+
+# 1シミュレーションステップで1ゲームから同時に降りるパス数
+# 大きいほどバッチが太くなるが、探索の多様性が若干下がる
+# 4〜8 が実用的なバランス
+N_VL = 8
+
+# Virtual Lossの重み（通過ノードに加える仮の負け数）
+VIRTUAL_LOSS = 1
 
 
 class GameMCTS:
     """1ゲーム分のMCTS状態"""
+
     def __init__(self, board: np.ndarray, to_play: int,
                  dirichlet_alpha: float, dirichlet_eps: float, add_noise: bool):
         self.root = Node(board.copy(), to_play)
         self.dirichlet_alpha = dirichlet_alpha
         self.dirichlet_eps = dirichlet_eps
         self.add_noise = add_noise
-        self.pending_path = None
-        self.pending_leaf = None
 
     def add_dirichlet_noise(self):
         moves = list(self.root.children.keys())
@@ -34,13 +48,31 @@ class GameMCTS:
             child = self.root.children[m]
             child.P = (1 - eps) * child.P + eps * float(noise[i])
 
-    def select_leaf(self):
+    def select_leaf_with_vl(self):
+        """
+        Virtual Lossを付けながら葉まで降りる。
+
+        Returns:
+          (path, value):
+            終局に到達した場合 → value は確定値（float）
+            展開が必要な葉    → value は None
+        通過したノードには N+=VIRTUAL_LOSS, W-=VIRTUAL_LOSS を加えておく。
+        backprop時に実際の値で上書き（除去）する。
+        """
         path = [self.root]
         current = self.root
+
+        # Virtual Lossを仮付与
+        current.N += VIRTUAL_LOSS
+        current.W -= VIRTUAL_LOSS
+
         while not current.is_leaf():
             current = current.best_child()
             path.append(current)
+            current.N += VIRTUAL_LOSS
+            current.W -= VIRTUAL_LOSS
 
+        # 終局チェック
         last_move = current.move
         if last_move is not None:
             r, c = divmod(last_move, 15)
@@ -50,16 +82,30 @@ class GameMCTS:
             if not get_legal_moves(current.board):
                 return path, 0.0
 
-        self.pending_path = path
-        self.pending_leaf = current
         return path, None
 
-    def backprop(self, path, value):
+    def backprop_with_vl(self, path: list, value: float):
+        """
+        Virtual Lossを除去しながら実際の値でbackpropする。
+        N から VIRTUAL_LOSS を引いて正味の N に戻してから +1 する。
+        W から -VIRTUAL_LOSS を引いて（つまり足して）正味の W に戻してから value を足す。
+        """
         v = value
         for node in reversed(path):
-            node.N += 1
-            node.W += v
+            # Virtual Lossを除去してから実値を加算
+            node.N += 1 - VIRTUAL_LOSS
+            node.W += v + VIRTUAL_LOSS
             v = -v
+
+    def backprop_remove_vl(self, path: list):
+        """
+        終局パスで推論不要だった場合でも Virtual Loss の除去だけ行う
+        （backprop_with_vl と同じだが value=0 扱い → 引き分け相当）。
+        実際は呼ばれないが安全策として用意。
+        """
+        for node in reversed(path):
+            node.N -= VIRTUAL_LOSS
+            node.W += VIRTUAL_LOSS
 
 
 class WorkerMCTS:
@@ -97,8 +143,36 @@ class WorkerMCTS:
             )
         node.is_expanded = True
 
+    def _batch_infer(self, nodes: list) -> list:
+        """
+        複数ノードの推論リクエストをまとめてキューに送り、まとめて受け取る。
+        全リクエストを先にキューに積んでからブロック待機することで、
+        サーバー側が大きなバッチを形成できる。
+        """
+        if not nodes:
+            return []
+
+        for node in nodes:
+            self.client.req_queue.put(
+                (CMD_INFER, self.client.worker_id, node.board, node.to_play)
+            )
+
+        results = []
+        for _ in nodes:
+            policy, value = self.client.result_queue.get()
+            results.append((policy, value))
+
+        return results
+
     def get_action_probs_batch(self, boards, to_plays, temperature=1.0):
-        """複数ゲームの探索をまとめて実行（ワーカー内で並列）"""
+        """
+        複数ゲームの探索をVirtual Lossつきで実行する。
+
+        各シミュレーションステップで全ゲームから N_VL 本ずつパスを降ろし、
+        まとめてGPU推論することでバッチサイズを
+          n_games × N_VL（最大）
+        に拡大する。
+        """
         n_games = len(boards)
         games = [
             GameMCTS(boards[i], to_plays[i],
@@ -106,29 +180,44 @@ class WorkerMCTS:
             for i in range(n_games)
         ]
 
-        # ルート展開（推論サーバーに投げてまとめて受け取る）
-        for g in games:
-            policy, _ = self.client.infer(g.root.board, g.root.to_play)
+        # ── ルート展開（全ゲームまとめてバッチ推論）──────────────
+        root_results = self._batch_infer([g.root for g in games])
+        for g, (policy, _) in zip(games, root_results):
             self._expand_node(g.root, policy)
             if g.add_noise:
                 g.add_dirichlet_noise()
 
-        # シミュレーションループ
-        for _ in range(self.n_sim):
-            for g in games:
-                path, value = g.select_leaf()
-                if value is not None:
-                    g.backprop(path, value)
-                else:
-                    # 葉ノードを推論サーバーで評価
-                    leaf = g.pending_leaf
-                    policy, value = self.client.infer(leaf.board, leaf.to_play)
-                    self._expand_node(leaf, policy)
-                    g.backprop(g.pending_path, value)
-                    g.pending_path = None
-                    g.pending_leaf = None
+        # ── シミュレーションループ ───────────────────────────────
+        # n_sim 回のシミュレーションを N_VL 本ずつまとめて処理する
+        steps = (self.n_sim + N_VL - 1) // N_VL  # 切り上げ
 
-        # 着手確率を計算
+        for _ in range(steps):
+            # (game, path, value_or_None) のリスト
+            pending_infer = []   # GPU推論が必要なもの
+            pending_terminal = []  # 終局（即backprop）
+
+            for g in games:
+                for _ in range(N_VL):
+                    path, value = g.select_leaf_with_vl()
+                    if value is not None:
+                        # 終局確定 → Virtual Lossを込みで即backprop
+                        g.backprop_with_vl(path, value)
+                    else:
+                        pending_infer.append((g, path))
+
+            if not pending_infer:
+                continue
+
+            # 推論待ちの葉をまとめてバッチ推論
+            leaves = [path[-1] for _, path in pending_infer]
+            infer_results = self._batch_infer(leaves)
+
+            for (g, path), (policy, value) in zip(pending_infer, infer_results):
+                leaf = path[-1]
+                self._expand_node(leaf, policy)
+                g.backprop_with_vl(path, float(value))
+
+        # ── 着手確率を計算 ───────────────────────────────────────
         results = []
         for g in games:
             counts = np.zeros(225)
@@ -138,6 +227,7 @@ class WorkerMCTS:
                 probs = np.zeros_like(counts)
                 probs[np.argmax(counts)] = 1.0
             else:
+                counts = np.maximum(counts, 0)  # 念のため負値ガード
                 counts = counts ** (1.0 / temperature)
                 s = counts.sum()
                 probs = counts / s if s > 0 else np.ones_like(counts) / len(counts)

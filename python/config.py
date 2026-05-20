@@ -10,46 +10,47 @@ class Config:
 
     # ── ネットワーク ─────────────────────────────────
     in_channels: int = 3
-    num_filters: int = 64
-    num_res_blocks: int = 5
+    num_filters: int = 128
+    num_res_blocks: int = 10
 
     # ── MCTS ─────────────────────────────────────────
-    n_simulations: int = 1600      # 1手あたりの探索回数
+    n_simulations: int = 800
     c_puct: float = 1.5
-    dirichlet_alpha: float = 0.3  # 探索の多様性（ルートにのみ加算）
-    dirichlet_eps: float = 0.20   # ノイズの混合率
+    dirichlet_alpha: float = 0.3
+    dirichlet_eps: float = 0.20
 
     # ── 自己対局 ─────────────────────────────────────
-    games_per_iteration: int = 50      # 1イテレーションあたりの対局数
+    games_per_iteration: int = 50
+
     # ── マルチプロセス並列化 ─────────────────────────
-    num_workers: int = 12              # 自己対局ワーカープロセス数（CPUコア数に合わせる）
-    parallel_inner: int = 8            # 各ワーカー内で並列に進めるゲーム数
-    infer_batch_wait_ms: float = 2.0   # 推論サーバーがバッチを集める待機時間
-    infer_max_batch: int = 256         # 推論サーバーの最大バッチサイズ
+    num_workers: int = 16
+    parallel_inner: int = 32
+    infer_batch_wait_ms: float = 5.0
+    infer_max_batch: int = 1024
     parallel_games: int = 16           # 旧設定（互換用、未使用）
-    temperature_threshold: int = 15    # この手数まで温度=1（探索）、以降は温度→0
-    max_moves: int = 225               # 最大手数
+    temperature_threshold: int = 15
+    max_moves: int = 225
 
     # ── 学習 ─────────────────────────────────────────
-    batch_size: int = 256
-    learning_rate: float = 3e-4        # 1e-3 → 3e-4（発散抑制）
+    batch_size: int = 512
+    learning_rate: float = 3e-4
     weight_decay: float = 1e-4
-    epochs_per_iteration: int = 3      # 5 → 3（過学習抑制）
-    replay_buffer_size: int = 200_000  # 50,000 → 200,000
+    epochs_per_iteration: int = 3
+    replay_buffer_size: int = 200_000
 
     # ── 学習ループ全体 ───────────────────────────────
     num_iterations: int = 100
 
     # ── パス ─────────────────────────────────────────
-    model_path: str = "/workspace/models/model.bin"
-    best_model_path: str = "/workspace/models/best_model.bin"  # 追加
-    checkpoint_dir: str = "/workspace/models/checkpoints"
-    stats_path: str = "/workspace/models/training_stats.json"
-    buffer_path: str = "/workspace/models/replay_buffer.npz"
+    model_path: str      = "/workspace/models/model.bin"
+    best_model_path: str = "/workspace/models/best_model.bin"
+    checkpoint_dir: str  = "/workspace/models/checkpoints"
+    stats_path: str      = "/workspace/models/training_stats.json"
+    buffer_path: str     = "/workspace/models/replay_buffer.npz"
+    log_path: str        = "/workspace/logs/train.log"
 
     # ── デバイス ─────────────────────────────────────
-    device: str = "cuda"  # "cpu" / "cuda"
+    device: str = "cuda"
 
 
-# デフォルトインスタンス（必要に応じてコピーして変更）
 DEFAULT = Config()
