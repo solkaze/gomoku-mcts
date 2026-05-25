@@ -27,8 +27,9 @@ from logger import setup_main_logger
 # ── 損失関数 ────────────────────────────────────────────────
 
 def alphazero_loss(pred_policy, pred_value, target_policy, target_value):
-    eps         = 1e-9
-    policy_loss = -(target_policy * torch.log(pred_policy + eps)).sum(dim=1).mean()
+    # pred_policy は学習時にlogitsで来る。log_softmaxで数値安定に計算する。
+    log_probs   = nn.functional.log_softmax(pred_policy, dim=1)
+    policy_loss = -(target_policy * log_probs).sum(dim=1).mean()
     value_loss  = nn.functional.mse_loss(pred_value, target_value)
     return policy_loss + value_loss, policy_loss, value_loss
 

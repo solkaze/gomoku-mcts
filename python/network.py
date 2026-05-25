@@ -74,7 +74,9 @@ class GomokuNet(nn.Module):
         p = F.relu(self.policy_bn(self.policy_conv(x)))
         p = p.view(p.size(0), -1)
         p = self.policy_fc(p)
-        policy = F.softmax(p, dim=1)
+        # 学習時はlogitsを返し、train.py側でlog_softmaxを使って数値安定に計算する
+        # 推論時（eval mode）は softmax 済み確率を返す
+        policy = p if self.training else F.softmax(p, dim=1)
 
         v = F.relu(self.value_bn(self.value_conv(x)))
         v = v.view(v.size(0), -1)

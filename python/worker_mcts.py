@@ -87,14 +87,19 @@ class GameMCTS:
     def backprop_with_vl(self, path: list, value: float):
         """
         Virtual Lossを除去しながら実際の値でbackpropする。
-        N から VIRTUAL_LOSS を引いて正味の N に戻してから +1 する。
-        W から -VIRTUAL_LOSS を引いて（つまり足して）正味の W に戻してから value を足す。
+        Step1: select_leaf_with_vl で仮加算した Virtual Loss を除去する。
+        Step2: 通常の backprop（N+=1, W+=v, 親に上がるたびに符号反転）。
         """
+        # Step 1: Virtual Loss を除去
+        for node in path:
+            node.N -= VIRTUAL_LOSS
+            node.W += VIRTUAL_LOSS
+
+        # Step 2: 通常 backprop
         v = value
         for node in reversed(path):
-            # Virtual Lossを除去してから実値を加算
-            node.N += 1 - VIRTUAL_LOSS
-            node.W += v + VIRTUAL_LOSS
+            node.N += 1
+            node.W += v
             v = -v
 
     def backprop_remove_vl(self, path: list):

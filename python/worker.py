@@ -115,7 +115,8 @@ def _play_games_slots(mcts, n_games, n_slots, temperature_threshold, max_moves, 
                 g.finished = True
             elif g.move_idx + 1 >= max_moves:
                 g.finished = True
-            else:
+
+            if not g.finished:
                 g.to_play  = 3 - g.to_play
                 g.move_idx += 1
 
