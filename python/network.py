@@ -134,7 +134,6 @@ class GomokuNet(nn.Module):
     @classmethod
     def load_binary(cls, path, device=None):
         path  = Path(path)
-        model = cls()
         with open(path, "rb") as f:
             magic = f.read(4)
             assert magic == b"GNET", f"Invalid magic: {magic}"
@@ -150,6 +149,9 @@ class GomokuNet(nn.Module):
                     num_elems *= s
                 data     = np.frombuffer(f.read(num_elems * 4), dtype=np.float32).reshape(shape)
                 state[name] = torch.from_numpy(data.copy())
+        filters = state["stem.0.weight"].shape[0]
+        num_res = len({k.split(".")[1] for k in state if k.startswith("res_blocks.")})
+        model = cls(filters=filters, res_blocks=num_res)
         model.load_state_dict(state)
         if device is not None:
             model = model.to(device)
